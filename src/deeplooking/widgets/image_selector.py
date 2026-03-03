@@ -1,5 +1,8 @@
 """Image browsing and selection widget with thumbnail grid."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -14,8 +17,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from deeplooking.constants import THUMBNAIL_SIZE
+from deeplooking.constants import Resolution, THUMBNAIL_SIZE
 from deeplooking.image_processing import get_image_dimensions, load_thumbnail, pillow_to_qpixmap
+from deeplooking.models import SliceRegion
 
 
 class ThumbnailLoader(QThread):
@@ -50,6 +54,9 @@ class ImageTile(QWidget):
         self.image_path = image_path
         self.image_width = 0
         self.image_height = 0
+        self._custom_slices: list[SliceRegion] = []
+        self._custom_slices_resolution: Resolution | None = None
+        self._request_custom_editor: Callable[[ImageTile], None] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -76,6 +83,7 @@ class ImageTile(QWidget):
         self._slice_mode.addItems(["Default (8 slices)", "Custom"])
         self._slice_mode.setEnabled(False)
         self._checkbox.stateChanged.connect(lambda state: self._slice_mode.setEnabled(bool(state)))
+        self._slice_mode.currentIndexChanged.connect(self._on_slice_mode_changed)
         layout.addWidget(self._slice_mode)
 
     @property
@@ -87,6 +95,35 @@ class ImageTile(QWidget):
     def use_default_slicing(self) -> bool:
         """Whether default slicing mode is selected."""
         return self._slice_mode.currentIndex() == 0
+
+    def _on_slice_mode_changed(self, index: int) -> None:
+        """Handle slice mode dropdown change. Open editor for Custom mode."""
+        if index == 1 and self._request_custom_editor is not None:
+            self._request_custom_editor(self)
+
+    def set_custom_editor_callback(self, callback: Callable[[ImageTile], None]) -> None:
+        """Set the callback invoked when the user selects Custom slice mode."""
+        self._request_custom_editor = callback
+
+    @property
+    def custom_slices(self) -> list[SliceRegion]:
+        """Return stored custom slices, if any."""
+        return list(self._custom_slices)
+
+    @property
+    def custom_slices_resolution(self) -> Resolution | None:
+        """Return the resolution the custom slices were created against."""
+        return self._custom_slices_resolution
+
+    def set_custom_slices(self, slices: list[SliceRegion], resolution: Resolution) -> None:
+        """Store custom slices and the resolution they were defined for."""
+        self._custom_slices = list(slices)
+        self._custom_slices_resolution = resolution
+
+    def clear_custom_slices(self) -> None:
+        """Discard stored custom slices."""
+        self._custom_slices.clear()
+        self._custom_slices_resolution = None
 
     def set_thumbnail(self, pixmap: QPixmap, width: int, height: int) -> None:
         """Set the thumbnail image and store original dimensions."""
@@ -112,6 +149,7 @@ class ImageSelectorWidget(QWidget):
         super().__init__(parent)
         self._tiles: list[ImageTile] = []
         self._loader: ThumbnailLoader | None = None
+        self._custom_editor_callback: Callable[[ImageTile], None] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -156,6 +194,8 @@ class ImageSelectorWidget(QWidget):
         for i, path in enumerate(image_paths):
             tile = ImageTile(path, self._grid_widget)
             tile.selection_changed.connect(self.selection_changed.emit)
+            if self._custom_editor_callback is not None:
+                tile.set_custom_editor_callback(self._custom_editor_callback)
             self._tiles.append(tile)
             row, col = divmod(i, self.COLUMNS)
             self._grid_layout.addWidget(tile, row, col)
@@ -168,6 +208,12 @@ class ImageSelectorWidget(QWidget):
         """Update a tile with its loaded thumbnail."""
         if 0 <= index < len(self._tiles):
             self._tiles[index].set_thumbnail(pixmap, width, height)
+
+    def set_custom_editor_callback(self, callback: Callable[[ImageTile], None]) -> None:
+        """Set the callback passed to each tile for custom slice editing."""
+        self._custom_editor_callback = callback
+        for tile in self._tiles:
+            tile.set_custom_editor_callback(callback)
 
     def get_selected_tiles(self) -> list[ImageTile]:
         """Return all tiles that are checked for viewing."""

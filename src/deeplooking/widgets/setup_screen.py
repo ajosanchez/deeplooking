@@ -25,7 +25,7 @@ from deeplooking.constants import (
 )
 from deeplooking.image_processing import generate_default_slices
 from deeplooking.models import PaintingConfig, ViewingSession
-from deeplooking.widgets.image_selector import ImageSelectorWidget
+from deeplooking.widgets.image_selector import ImageSelectorWidget, ImageTile
 
 
 class ResolutionComboBox(QWidget):
@@ -125,6 +125,7 @@ class SetupWindow(QMainWindow):
         # Image selector
         self._image_selector = ImageSelectorWidget()
         self._image_selector.selection_changed.connect(self._update_start_button)
+        self._image_selector.set_custom_editor_callback(self._open_custom_slice_editor)
         main_layout.addWidget(self._image_selector)
 
         # Start button
@@ -148,6 +149,45 @@ class SetupWindow(QMainWindow):
         selected = self._image_selector.get_selected_tiles()
         self._start_btn.setEnabled(len(selected) > 0)
 
+    def _open_custom_slice_editor(self, tile: ImageTile) -> None:
+        """Open the SliceEditorDialog for the given tile using the current resolution."""
+        from deeplooking.widgets.slice_editor import SliceEditorDialog
+
+        if tile.image_width == 0 or tile.image_height == 0:
+            QMessageBox.warning(
+                self,
+                "Image Not Loaded",
+                f"Thumbnail for {tile.image_path.name} hasn't finished loading yet. "
+                "Please wait a moment and try again.",
+            )
+            tile._slice_mode.setCurrentIndex(0)
+            return
+
+        resolution = self._resolution_combo.selected_resolution
+
+        dialog = SliceEditorDialog(
+            image_path=tile.image_path,
+            image_width=tile.image_width,
+            image_height=tile.image_height,
+            target_resolution=resolution,
+            parent=self,
+        )
+        if dialog.exec():
+            slices = dialog.get_slices()
+            if slices:
+                tile.set_custom_slices(slices, resolution)
+            else:
+                QMessageBox.information(
+                    self,
+                    "No Slices Created",
+                    "No custom slices were defined. Reverting to default slicing.",
+                )
+                tile._slice_mode.setCurrentIndex(0)
+                tile.clear_custom_slices()
+        else:
+            tile._slice_mode.setCurrentIndex(0)
+            tile.clear_custom_slices()
+
     def _build_session(self) -> ViewingSession | None:
         """Construct a ViewingSession from the current setup, or None if invalid."""
         selected_tiles = self._image_selector.get_selected_tiles()
@@ -168,20 +208,24 @@ class SetupWindow(QMainWindow):
             if tile.use_default_slicing:
                 config.slices = generate_default_slices(config.image_width, config.image_height)
             else:
-                # Custom slicing: open the slice editor
-                from deeplooking.widgets.slice_editor import SliceEditorDialog
-
-                dialog = SliceEditorDialog(
-                    image_path=tile.image_path,
-                    image_width=tile.image_width,
-                    image_height=tile.image_height,
-                    target_resolution=resolution,
-                    parent=self,
-                )
-                if dialog.exec():
-                    config.slices = dialog.get_slices()
+                # Custom slicing: use pre-stored slices if available and resolution matches
+                if tile.custom_slices and tile.custom_slices_resolution == resolution:
+                    config.slices = tile.custom_slices
                 else:
-                    return None  # User cancelled
+                    # Slices not yet created or resolution changed; open editor as fallback
+                    from deeplooking.widgets.slice_editor import SliceEditorDialog
+
+                    dialog = SliceEditorDialog(
+                        image_path=tile.image_path,
+                        image_width=tile.image_width,
+                        image_height=tile.image_height,
+                        target_resolution=resolution,
+                        parent=self,
+                    )
+                    if dialog.exec():
+                        config.slices = dialog.get_slices()
+                    else:
+                        return None  # User cancelled
 
                 if not config.slices:
                     QMessageBox.warning(
