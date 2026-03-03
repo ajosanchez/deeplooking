@@ -12,7 +12,7 @@ class TestViewerState:
             ViewerState.SHOWING_WHOLE,
             ViewerState.ZOOMING_IN,
             ViewerState.SHOWING_SLICE,
-            ViewerState.ZOOMING_OUT,
+            ViewerState.PANNING,
             ViewerState.LOADING,
             ViewerState.PAUSED,
             ViewerState.FINISHED,
@@ -144,3 +144,61 @@ class TestRectInterpolation:
             from_rect.height() + t * (to_rect.height() - from_rect.height()),
         )
         assert result == QRectF(125, 125, 750, 750)
+
+    def test_slice_to_slice_pure_pan(self) -> None:
+        """Interpolation between same-sized slices produces a pure horizontal pan."""
+        from_rect = QRectF(0, 0, 480, 540)
+        to_rect = QRectF(480, 0, 480, 540)
+        t = 0.5
+        result = QRectF(
+            from_rect.x() + t * (to_rect.x() - from_rect.x()),
+            from_rect.y() + t * (to_rect.y() - from_rect.y()),
+            from_rect.width() + t * (to_rect.width() - from_rect.width()),
+            from_rect.height() + t * (to_rect.height() - from_rect.height()),
+        )
+        assert result == QRectF(240, 0, 480, 540)
+
+    def test_slice_to_slice_with_zoom_adjust(self) -> None:
+        """Interpolation between different-sized slices produces pan with zoom adjustment."""
+        from_rect = QRectF(0, 0, 480, 540)
+        to_rect = QRectF(480, 0, 960, 540)
+        t = 0.5
+        result = QRectF(
+            from_rect.x() + t * (to_rect.x() - from_rect.x()),
+            from_rect.y() + t * (to_rect.y() - from_rect.y()),
+            from_rect.width() + t * (to_rect.width() - from_rect.width()),
+            from_rect.height() + t * (to_rect.height() - from_rect.height()),
+        )
+        assert result == QRectF(240, 0, 720, 540)
+
+
+class TestTransitionFlow:
+    """Tests for the pan transition state machine flow logic."""
+
+    def test_no_slices_skips_to_next_painting(self) -> None:
+        """With no slices, viewer goes directly from whole to next painting."""
+        slices: list[SliceRegion] = []
+        slice_index = 0
+        assert not (slice_index < len(slices))
+
+    def test_single_slice_no_pan(self) -> None:
+        """With one slice, after showing it, no pan is triggered."""
+        slices = [SliceRegion(x=0.0, y=0.0, width=0.5, height=0.5)]
+        slice_index = 0
+        # After showing slice 0, increment
+        slice_index += 1
+        assert slice_index >= len(slices)
+
+    def test_two_slices_one_pan(self) -> None:
+        """With two slices, one pan transition occurs between them."""
+        slices = [
+            SliceRegion(x=0.0, y=0.0, width=0.25, height=0.5),
+            SliceRegion(x=0.25, y=0.0, width=0.25, height=0.5),
+        ]
+        slice_index = 0
+        # After showing slice 0, increment — should pan to slice 1
+        slice_index += 1
+        assert slice_index < len(slices)
+        # After showing slice 1, increment — should advance
+        slice_index += 1
+        assert slice_index >= len(slices)

@@ -25,7 +25,7 @@ class ViewerState(Enum):
     SHOWING_WHOLE = "showing_whole"
     ZOOMING_IN = "zooming_in"
     SHOWING_SLICE = "showing_slice"
-    ZOOMING_OUT = "zooming_out"
+    PANNING = "panning"
     LOADING = "loading"
     PAUSED = "paused"
     FINISHED = "finished"
@@ -200,8 +200,12 @@ class ViewerWindow(QMainWindow):
                 self._advance_to_next_painting()
 
         elif self._state == ViewerState.SHOWING_SLICE:
-            # Time to zoom out from the current slice
-            self._start_zoom_out()
+            # Pan to the next slice or advance to the next painting
+            self._slice_index += 1
+            if self._slice_index < len(self._current_painting.slices):
+                self._start_pan_to_next_slice()
+            else:
+                self._advance_to_next_painting()
 
     def _start_zoom_in(self) -> None:
         """Animate zooming in from the whole image to the current slice."""
@@ -219,24 +223,20 @@ class ViewerWindow(QMainWindow):
         hold_time = max(100, self._time_per_view_ms - self._anim_duration_ms)
         self._view_timer.start(hold_time)
 
-    def _start_zoom_out(self) -> None:
-        """Animate zooming out from the current slice back to the whole image."""
-        self._state = ViewerState.ZOOMING_OUT
-        slice_region = self._current_painting.slices[self._slice_index]
-        from_rect = self._slice_to_scene_rect(slice_region)
-        to_rect = self._scene.sceneRect()
+    def _start_pan_to_next_slice(self) -> None:
+        """Animate panning from the previous slice to the current slice."""
+        self._state = ViewerState.PANNING
+        prev_region = self._current_painting.slices[self._slice_index - 1]
+        curr_region = self._current_painting.slices[self._slice_index]
+        from_rect = self._slice_to_scene_rect(prev_region)
+        to_rect = self._slice_to_scene_rect(curr_region)
+        self._animate_zoom(from_rect, to_rect, self._on_pan_complete)
 
-        self._animate_zoom(from_rect, to_rect, self._on_zoom_out_complete)
-
-    def _on_zoom_out_complete(self) -> None:
-        """Zoom out finished — advance to the next slice or painting."""
-        self._slice_index += 1
-        if self._slice_index < len(self._current_painting.slices):
-            # Zoom into the next slice
-            self._start_zoom_in()
-        else:
-            # Done with this painting
-            self._advance_to_next_painting()
+    def _on_pan_complete(self) -> None:
+        """Pan animation finished — hold on the new slice."""
+        self._state = ViewerState.SHOWING_SLICE
+        hold_time = max(100, self._time_per_view_ms - self._anim_duration_ms)
+        self._view_timer.start(hold_time)
 
     def _advance_to_next_painting(self) -> None:
         """Move to the next painting or finish."""
@@ -309,7 +309,7 @@ class ViewerWindow(QMainWindow):
             ViewerState.SHOWING_WHOLE,
             ViewerState.SHOWING_SLICE,
             ViewerState.ZOOMING_IN,
-            ViewerState.ZOOMING_OUT,
+            ViewerState.PANNING,
         ):
             # Pause
             self._paused_state = self._state
