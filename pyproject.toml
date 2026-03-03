@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deeplooking"
+version = "0.1.0"
+description = "A contemplative art viewing application for deep, immersive exploration of paintings"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=12.1.1",
+    "pyside6>=6.10.2",
+]
+
+[project.scripts]
+deeplooking = "deeplooking.cli:main"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "pytest>=9.0.2",
+    "pytest-qt>=4.4.0",
+    "ruff>=0.15.4",
+    "ty>=0.0.20",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
