@@ -1,9 +1,10 @@
 """Custom slicing dialog with interactive green rectangle overlay."""
 
+from enum import Enum, auto
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QGraphicsPixmapItem,
@@ -15,15 +16,73 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QStyleOptionGraphicsItem,
     QVBoxLayout,
     QWidget,
 )
 
-from deeplooking.constants import MINI_THUMBNAIL_SIZE, Resolution, SLICE_RECT_COLOR, SLICE_RECT_WIDTH
+from deeplooking.constants import (
+    MINI_THUMBNAIL_SIZE,
+    RESIZE_HANDLE_SIZE,
+    Resolution,
+    SLICE_RECT_COLOR,
+    SLICE_RECT_WIDTH,
+)
 from deeplooking.image_processing import compute_slice_rect_normalized, load_thumbnail, pillow_to_qpixmap
 from deeplooking.models import SliceRegion
 
 EDITOR_THUMBNAIL_MAX = 800
+
+
+class _InteractionMode(Enum):
+    """Internal interaction state for SliceScene mouse handling."""
+
+    IDLE = auto()
+    DRAGGING = auto()
+    RESIZING = auto()
+
+
+class _Corner(Enum):
+    """Identifies which corner is being dragged during resize."""
+
+    TOP_LEFT = auto()
+    TOP_RIGHT = auto()
+    BOTTOM_LEFT = auto()
+    BOTTOM_RIGHT = auto()
+
+
+class _SelectorRectItem(QGraphicsRectItem):
+    """Selector rectangle with visible corner resize handles."""
+
+    def __init__(self, rect: QRectF, pen: QPen, brush: QBrush, handle_size: int) -> None:
+        super().__init__(rect)
+        self.setPen(pen)
+        self.setBrush(brush)
+        self._handle_size = handle_size
+
+    def boundingRect(self) -> QRectF:
+        """Expand bounding rect to include corner handles outside the rect edges."""
+        r = super().boundingRect()
+        hs = self._handle_size
+        return r.adjusted(-hs, -hs, hs, hs)
+
+    def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: QWidget | None = None) -> None:
+        """Draw the rect and then overlay corner handle squares."""
+        super().paint(painter, option, widget)
+        r = self.rect()
+        hs = self._handle_size
+        handle_pen = QPen(QColor(SLICE_RECT_COLOR), 1)
+        handle_brush = QBrush(QColor(0, 255, 0, 160))
+        painter.setPen(handle_pen)
+        painter.setBrush(handle_brush)
+        corners = [
+            (r.left(), r.top()),
+            (r.right(), r.top()),
+            (r.left(), r.bottom()),
+            (r.right(), r.bottom()),
+        ]
+        for cx, cy in corners:
+            painter.drawRect(QRectF(cx - hs, cy - hs, hs * 2, hs * 2))
 
 
 class SliceMiniThumbnail(QWidget):
@@ -58,9 +117,9 @@ class SliceMiniThumbnail(QWidget):
 
 
 class SliceScene(QGraphicsScene):
-    """Graphics scene that handles click-to-stamp interaction."""
+    """Graphics scene that handles click-to-stamp and corner-resize interaction."""
 
-    slice_stamped = Signal(float, float)  # normalized x, y of the stamp
+    slice_stamped = Signal(float, float, float, float)  # normalized x, y, width, height
 
     def __init__(
         self,
@@ -73,51 +132,198 @@ class SliceScene(QGraphicsScene):
         self._pixmap_item = pixmap_item
         self._rect_width_norm = rect_width_norm
         self._rect_height_norm = rect_height_norm
+        self._min_width_norm = rect_width_norm
+        self._min_height_norm = rect_height_norm
         self._img_w = float(pixmap_item.pixmap().width())
         self._img_h = float(pixmap_item.pixmap().height())
 
-        # Green selection rectangle
+        # Pixel aspect ratio for locked resizing
+        self._aspect_ratio = (rect_width_norm * self._img_w) / (rect_height_norm * self._img_h)
+
+        # Green selection rectangle with corner handles
         rect_w = self._rect_width_norm * self._img_w
         rect_h = self._rect_height_norm * self._img_h
         pen = QPen(QColor(SLICE_RECT_COLOR), SLICE_RECT_WIDTH)
         brush = QBrush(QColor(0, 255, 0, 40))
-        self._selector_rect = self.addRect(QRectF(0, 0, rect_w, rect_h), pen, brush)
+        self._selector_rect = _SelectorRectItem(QRectF(0, 0, rect_w, rect_h), pen, brush, RESIZE_HANDLE_SIZE)
         self._selector_rect.setZValue(10)
+        self.addItem(self._selector_rect)
 
-        self._dragging = False
+        # Interaction state
+        self._mode = _InteractionMode.IDLE
         self._drag_offset_x = 0.0
         self._drag_offset_y = 0.0
+        self._resize_corner: _Corner | None = None
+        self._resize_anchor_x = 0.0
+        self._resize_anchor_y = 0.0
+
+    def _hit_test_corner(self, scene_x: float, scene_y: float) -> _Corner | None:
+        """Check if a scene position is within a corner handle's hit zone."""
+        rect = self._selector_rect.rect()
+        threshold = float(RESIZE_HANDLE_SIZE + 2)
+
+        corners: list[tuple[float, float, _Corner]] = [
+            (rect.left(), rect.top(), _Corner.TOP_LEFT),
+            (rect.right(), rect.top(), _Corner.TOP_RIGHT),
+            (rect.left(), rect.bottom(), _Corner.BOTTOM_LEFT),
+            (rect.right(), rect.bottom(), _Corner.BOTTOM_RIGHT),
+        ]
+
+        for cx, cy, corner in corners:
+            if abs(scene_x - cx) <= threshold and abs(scene_y - cy) <= threshold:
+                return corner
+        return None
 
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Start dragging if click is on the selector rect, otherwise stamp."""
+        """Start resizing, dragging, or stamp depending on click location."""
         pos = event.scenePos()
         rect = self._selector_rect.rect()
-        rect_scene = self._selector_rect.mapToScene(rect).boundingRect()
 
+        # 1. Check corner handles first (they overlap the rect area)
+        corner = self._hit_test_corner(pos.x(), pos.y())
+        if corner is not None:
+            self._mode = _InteractionMode.RESIZING
+            self._resize_corner = corner
+            if corner == _Corner.TOP_LEFT:
+                self._resize_anchor_x = rect.right()
+                self._resize_anchor_y = rect.bottom()
+            elif corner == _Corner.TOP_RIGHT:
+                self._resize_anchor_x = rect.left()
+                self._resize_anchor_y = rect.bottom()
+            elif corner == _Corner.BOTTOM_LEFT:
+                self._resize_anchor_x = rect.right()
+                self._resize_anchor_y = rect.top()
+            elif corner == _Corner.BOTTOM_RIGHT:
+                self._resize_anchor_x = rect.left()
+                self._resize_anchor_y = rect.top()
+            return
+
+        # 2. Check if click is inside the rect body -> drag
+        rect_scene = self._selector_rect.mapToScene(rect).boundingRect()
         if rect_scene.contains(pos):
-            self._dragging = True
+            self._mode = _InteractionMode.DRAGGING
             self._drag_offset_x = pos.x() - rect_scene.x()
             self._drag_offset_y = pos.y() - rect_scene.y()
-        else:
-            # Move rect to click position (centered), then stamp
-            self._move_rect_centered(pos.x(), pos.y())
-            self._stamp()
+            return
+
+        # 3. Click outside -> move centered and stamp
+        self._move_rect_centered(pos.x(), pos.y())
+        self._stamp()
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """Drag the selector rectangle."""
-        if self._dragging:
-            pos = event.scenePos()
+        """Handle dragging, resizing, or cursor updates on hover."""
+        pos = event.scenePos()
+
+        if self._mode == _InteractionMode.DRAGGING:
             new_x = pos.x() - self._drag_offset_x
             new_y = pos.y() - self._drag_offset_y
             self._move_rect_to(new_x, new_y)
+        elif self._mode == _InteractionMode.RESIZING:
+            self._resize_rect(pos.x(), pos.y())
+        else:
+            # Update cursor for corner hover
+            corner = self._hit_test_corner(pos.x(), pos.y())
+            views = self.views()
+            if views:
+                view = views[0]
+                if corner in (_Corner.TOP_LEFT, _Corner.BOTTOM_RIGHT):
+                    view.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif corner in (_Corner.TOP_RIGHT, _Corner.BOTTOM_LEFT):
+                    view.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                else:
+                    view.unsetCursor()
 
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
-        """End dragging."""
-        self._dragging = False
+        """End dragging or resizing."""
+        if self._mode == _InteractionMode.RESIZING:
+            rect = self._selector_rect.rect()
+            self._rect_width_norm = rect.width() / self._img_w
+            self._rect_height_norm = rect.height() / self._img_h
+        self._mode = _InteractionMode.IDLE
+        self._resize_corner = None
+        views = self.views()
+        if views:
+            views[0].unsetCursor()
 
     def mouseDoubleClickEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         """Double-click to stamp at current position."""
         self._stamp()
+
+    def _resize_rect(self, mouse_x: float, mouse_y: float) -> None:
+        """Resize the selector rect from the dragged corner, keeping aspect ratio locked.
+
+        The opposite corner (anchor) stays fixed. The dragged corner follows
+        the mouse along the aspect-ratio diagonal. Minimum size is the
+        resolution-derived 1:1 pixel mapping size.
+        """
+        anchor_x = self._resize_anchor_x
+        anchor_y = self._resize_anchor_y
+        aspect = self._aspect_ratio
+
+        # Compute desired dimensions from mouse distance to anchor
+        dx = abs(mouse_x - anchor_x)
+        dy = abs(mouse_y - anchor_y)
+
+        # Two candidate widths; pick the smaller (inscribed / inner-box approach)
+        w_from_x = dx
+        w_from_y = dy * aspect
+        new_w = min(w_from_x, w_from_y) if (w_from_x > 0 and w_from_y > 0) else max(w_from_x, w_from_y)
+        new_h = new_w / aspect if aspect > 0 else 0.0
+
+        # Enforce minimum size
+        min_w = self._min_width_norm * self._img_w
+        min_h = self._min_height_norm * self._img_h
+        if new_w < min_w:
+            new_w = min_w
+            new_h = min_h
+
+        # Determine top-left based on which corner is being dragged
+        if self._resize_corner in (_Corner.TOP_LEFT, _Corner.BOTTOM_LEFT):
+            new_left = anchor_x - new_w
+        else:
+            new_left = anchor_x
+
+        if self._resize_corner in (_Corner.TOP_LEFT, _Corner.TOP_RIGHT):
+            new_top = anchor_y - new_h
+        else:
+            new_top = anchor_y
+
+        # Clamp to image bounds, shrinking if necessary
+        if new_left < 0:
+            new_left = 0.0
+            if self._resize_corner in (_Corner.TOP_LEFT, _Corner.BOTTOM_LEFT):
+                new_w = anchor_x
+        if new_top < 0:
+            new_top = 0.0
+            if self._resize_corner in (_Corner.TOP_LEFT, _Corner.TOP_RIGHT):
+                new_h = anchor_y
+        if new_left + new_w > self._img_w:
+            new_w = self._img_w - new_left
+        if new_top + new_h > self._img_h:
+            new_h = self._img_h - new_top
+
+        # Re-enforce aspect ratio after clamping (take smaller dimension)
+        if new_h > 0 and new_w / new_h > aspect:
+            new_w = new_h * aspect
+        elif new_h > 0:
+            new_h = new_w / aspect
+
+        # Recompute position after aspect correction
+        if self._resize_corner in (_Corner.TOP_LEFT, _Corner.BOTTOM_LEFT):
+            new_left = anchor_x - new_w
+        if self._resize_corner in (_Corner.TOP_LEFT, _Corner.TOP_RIGHT):
+            new_top = anchor_y - new_h
+
+        # Final minimum enforcement
+        if new_w < min_w or new_h < min_h:
+            new_w = min_w
+            new_h = min_h
+            if self._resize_corner in (_Corner.TOP_LEFT, _Corner.BOTTOM_LEFT):
+                new_left = anchor_x - new_w
+            if self._resize_corner in (_Corner.TOP_LEFT, _Corner.TOP_RIGHT):
+                new_top = anchor_y - new_h
+
+        self._selector_rect.setRect(QRectF(new_left, new_top, new_w, new_h))
 
     def _move_rect_centered(self, cx: float, cy: float) -> None:
         """Move the selector rect so it's centered at (cx, cy), clamped to bounds."""
@@ -136,11 +342,13 @@ class SliceScene(QGraphicsScene):
         self._selector_rect.setRect(QRectF(clamped_x, clamped_y, rect.width(), rect.height()))
 
     def _stamp(self) -> None:
-        """Emit the current selector position as a normalized stamp."""
+        """Emit the current selector position and size as normalized values."""
         rect = self._selector_rect.rect()
         norm_x = rect.x() / self._img_w
         norm_y = rect.y() / self._img_h
-        self.slice_stamped.emit(norm_x, norm_y)
+        norm_w = rect.width() / self._img_w
+        norm_h = rect.height() / self._img_h
+        self.slice_stamped.emit(norm_x, norm_y, norm_w, norm_h)
 
     def add_overlay(self, slice_region: SliceRegion) -> QGraphicsRectItem:
         """Add a semi-transparent overlay for a stamped slice."""
@@ -209,7 +417,10 @@ class SliceEditorDialog(QDialog):
         self._graphics_view.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         left_layout.addWidget(self._graphics_view)
 
-        hint_label = QLabel("Click to move & stamp | Double-click to stamp in place | Drag the green box to reposition")
+        hint_label = QLabel(
+            "Click to move & stamp | Double-click to stamp in place"
+            " | Drag the green box to reposition | Drag corners to resize"
+        )
         hint_label.setStyleSheet("color: #888; font-size: 11px;")
         left_layout.addWidget(hint_label)
 
@@ -240,9 +451,9 @@ class SliceEditorDialog(QDialog):
 
         main_layout.addLayout(right_layout, stretch=1)
 
-    def _on_stamp(self, norm_x: float, norm_y: float) -> None:
+    def _on_stamp(self, norm_x: float, norm_y: float, norm_w: float, norm_h: float) -> None:
         """Handle a new slice stamp from the scene."""
-        region = SliceRegion(x=norm_x, y=norm_y, width=self._rect_w_norm, height=self._rect_h_norm)
+        region = SliceRegion(x=norm_x, y=norm_y, width=norm_w, height=norm_h)
         self._slices.append(region)
 
         # Add overlay to scene
